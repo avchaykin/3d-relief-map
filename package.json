@@ -1,0 +1,11 @@
+{
+  "name": "3d-relief-map",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pick an area on the world map and export a printable, multi-colour 3D relief model.",
+  "scripts": {
+    "start": "python3 -m http.server 5173",
+    "test": "node --import ./test/resolve-fflate.mjs test/mesher.test.mjs"
+  }
+}

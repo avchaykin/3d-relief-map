@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>3D Relief Map</title>
+  <link rel="stylesheet" href="vendor/leaflet.css">
+  <link rel="stylesheet" href="src/style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./vendor/three.module.min.js",
+      "three/addons/controls/OrbitControls.js": "./vendor/OrbitControls.js",
+      "leaflet": "./vendor/leaflet-src.esm.js",
+      "fflate": "./vendor/fflate.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>3D Relief Map</h1>
+    <form id="search" class="search">
+      <input id="search-input" type="search" placeholder="Search a place — e.g. Matterhorn, Yosemite, Crete" autocomplete="off">
+      <button type="submit">Search</button>
+    </form>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <section>
+        <h2>Area</h2>
+        <dl class="facts" id="area-facts"></dl>
+        <label class="row">Map style
+          <select data-param="basemap">
+            <option value="topo">Topographic</option>
+            <option value="osm">Streets</option>
+            <option value="satellite">Satellite</option>
+          </select>
+        </label>
+      </section>
+
+      <section>
+        <h2>Model</h2>
+        <label class="row">Longest side <span class="unit">mm</span>
+          <input type="number" data-param="sizeMM" min="20" max="400" step="5">
+        </label>
+        <label class="row">Detail <output data-for="resolution"></output>
+          <input type="range" data-param="resolution" min="60" max="500" step="20">
+        </label>
+        <label class="row">Smoothing <output data-for="smoothing"></output>
+          <input type="range" data-param="smoothing" min="0" max="6" step="1">
+        </label>
+        <label class="row">Sea
+          <select data-param="seaMode">
+            <option value="color">Flat, own color</option>
+            <option value="flat">Flat</option>
+            <option value="bathy">Show seabed</option>
+          </select>
+        </label>
+        <label class="row" id="coast-row">Coast step <span class="unit">layers</span>
+          <input type="number" data-param="coastLayers" min="1" max="20" step="1">
+        </label>
+        <label class="check">
+          <input type="checkbox" data-param="inlandWater"> Lakes and rivers in water color
+        </label>
+        <label class="row lake-row">Water depth <span class="unit">layers</span>
+          <input type="number" data-param="lakeLayers" min="1" max="20" step="1">
+        </label>
+        <label class="row lake-row">River width <span class="unit">mm</span>
+          <input type="number" data-param="riverMM" min="0.4" max="5" step="0.2">
+        </label>
+      </section>
+
+      <section>
+        <h2>Height curve</h2>
+        <div class="curve-head">
+          <select id="curve-preset" aria-label="Curve preset"></select>
+          <button id="curve-reset">Reset</button>
+        </div>
+        <canvas id="curve" class="curve" aria-label="Height curve editor"></canvas>
+        <div class="curve-axis"><span id="curve-min"></span><span id="curve-readout"></span><span id="curve-max"></span></div>
+        <p class="hint">Map elevation runs left to right, model height bottom to top; bars show how much terrain sits at each elevation. Drag points, click to add one, double-click to remove. Pull the end points inwards to clip the lowest or highest terrain.</p>
+      </section>
+
+      <section>
+        <h2>Print settings</h2>
+        <label class="row">Layer height <span class="unit">mm</span>
+          <input type="number" data-param="layerH" min="0.04" max="0.4" step="0.02">
+        </label>
+        <label class="row">Relief layers
+          <input type="number" data-param="reliefLayers" min="1" max="300" step="1">
+        </label>
+        <label class="row">Base thickness <span class="unit">mm</span>
+          <input type="number" data-param="baseMM" min="0.2" max="10" step="0.2">
+        </label>
+        <label class="check">
+          <input type="checkbox" data-param="snap"> Snap heights to layers (terraced look)
+        </label>
+        <dl class="facts" id="print-facts"></dl>
+      </section>
+
+      <section>
+        <h2>Colors</h2>
+        <label class="row">Number of colors <output data-for="nColors"></output>
+          <input type="range" data-param="nColors" min="1" max="8" step="1">
+        </label>
+        <label class="row">Palette
+          <select data-param="preset" id="preset"></select>
+        </label>
+        <label class="row">Split by
+          <select data-param="distribution">
+            <option value="height">Equal height</option>
+            <option value="area">Equal area</option>
+          </select>
+        </label>
+        <ol class="bands" id="bands"></ol>
+        <p class="hint" id="bands-hint"></p>
+      </section>
+
+      <section>
+        <h2>Export</h2>
+        <div class="exports">
+          <button data-export="3mf" class="primary" title="One file with a separate, colored part per filament">3MF · multi-color</button>
+          <button data-export="stl" title="Single solid, for one filament or manual color changes by layer">STL · single body</button>
+          <button data-export="stl-zip" title="One STL per color plus the filament change list">STL per color · zip</button>
+          <button data-export="obj" title="OBJ with materials">OBJ + MTL · zip</button>
+        </div>
+        <p class="hint" id="export-hint"></p>
+      </section>
+    </aside>
+
+    <div class="pane map-pane">
+      <div id="map"></div>
+      <div class="toolbar">
+        <button id="draw">Draw area</button>
+        <button id="select-view" title="Use the middle of the visible map as the area">Select visible</button>
+        <button id="focus" title="Zoom the map to the selected area">Go to selection</button>
+      </div>
+    </div>
+
+    <div class="pane preview-pane">
+      <div id="preview"></div>
+      <div class="toolbar">
+        <button id="reset-view">Reset view</button>
+      </div>
+      <div class="status" id="status" hidden></div>
+    </div>
+  </main>
+
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>
