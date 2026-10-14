@@ -228,3 +228,52 @@ export function buildInlay(zLow, zHigh, nx, ny, dx, dy) {
 
   return buf.done();
 }
+
+/**
+ * Closed solids between two heightfields (zLow <= zHigh), split by a class per grid
+ * triangle: one solid per class, walled off where the neighbouring triangle has
+ * another class. Triangle t of cell (i, j) is cls[(j * (nx - 1) + i) * 2 + s] with
+ * s = 0 for (BL, BR, TR) and s = 1 for (BL, TR, TL), the triangulation of buildBand.
+ * Shared walls have identical vertices, so the solids tile the volume exactly.
+ * @returns {Float32Array[]} one triangle soup per class 0..nClasses-1
+ */
+export function buildFacets(zLow, zHigh, nx, ny, dx, dy, cls, nClasses) {
+  const bufs = Array.from({ length: nClasses }, () => new TriBuffer());
+  const X = (i) => i * dx, Y = (j) => (ny - 1 - j) * dy;
+  const cw = nx - 1;
+  const clsAt = (i, j, s) => (i < 0 || j < 0 || i >= cw || j >= ny - 1 ? -1 : cls[(j * cw + i) * 2 + s]);
+
+  // wall on edge a->b (counter-clockwise around the triangle, so outward is to the right)
+  const wall = (buf, ia, ja, ib, jb) => {
+    const a = ja * nx + ia, b = jb * nx + ib;
+    const da = zLow[a] !== zHigh[a], db = zLow[b] !== zHigh[b];
+    const ax = X(ia), ay = Y(ja), bx = X(ib), by = Y(jb);
+    if (db) buf.tri(ax, ay, zLow[a], bx, by, zLow[b], bx, by, zHigh[b]);
+    if (da) buf.tri(ax, ay, zLow[a], bx, by, zHigh[b], ax, ay, zHigh[a]);
+  };
+  const prism = (buf, i0, j0, i1, j1, i2, j2) => {
+    const k0 = j0 * nx + i0, k1 = j1 * nx + i1, k2 = j2 * nx + i2;
+    if (zLow[k0] === zHigh[k0] && zLow[k1] === zHigh[k1] && zLow[k2] === zHigh[k2]) return;
+    buf.tri(X(i0), Y(j0), zHigh[k0], X(i1), Y(j1), zHigh[k1], X(i2), Y(j2), zHigh[k2]);
+    buf.tri(X(i0), Y(j0), zLow[k0], X(i2), Y(j2), zLow[k2], X(i1), Y(j1), zLow[k1]);
+  };
+
+  for (let j = 0; j < ny - 1; j++) {
+    for (let i = 0; i < cw; i++) {
+      const cA = clsAt(i, j, 0), cB = clsAt(i, j, 1);
+      // A: BL, BR, TR. Neighbours: south = cell below's B, east = cell right's B, diagonal = B
+      let buf = bufs[cA];
+      prism(buf, i, j + 1, i + 1, j + 1, i + 1, j);
+      if (clsAt(i, j + 1, 1) !== cA) wall(buf, i, j + 1, i + 1, j + 1);
+      if (clsAt(i + 1, j, 1) !== cA) wall(buf, i + 1, j + 1, i + 1, j);
+      if (cB !== cA) wall(buf, i + 1, j, i, j + 1);
+      // B: BL, TR, TL. Neighbours: north = cell above's A, west = cell left's A, diagonal = A
+      buf = bufs[cB];
+      prism(buf, i, j + 1, i + 1, j, i, j);
+      if (cA !== cB) wall(buf, i, j + 1, i + 1, j);
+      if (clsAt(i, j - 1, 0) !== cB) wall(buf, i + 1, j, i, j);
+      if (clsAt(i - 1, j, 0) !== cB) wall(buf, i, j, i, j + 1);
+    }
+  }
+  return bufs.map((b) => b.done());
+}

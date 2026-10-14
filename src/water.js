@@ -1,11 +1,34 @@
-// Lakes and rivers from OpenStreetMap, via the public OpenFreeMap vector tiles
-// (OpenMapTiles schema: polygons in "water", centre lines in "waterway").
+// Lakes, rivers and land cover from OpenStreetMap, via the public OpenFreeMap vector
+// tiles (OpenMapTiles schema: polygons in "water", centre lines in "waterway",
+// land cover polygons in "landcover" and "landuse", roads in "transportation").
 import { mercX, mercY } from './elevation.js';
 
 const TILEJSON = 'https://tiles.openfreemap.org/planet';
 const MAX_ZOOM = 14;
 const MAX_TILES = 40;
+const MAX_TILES_LANDCOVER = 48; // about 350 kB each
 const RIVER_CLASSES = new Set(['river', 'canal']);
+
+/** Land cover categories, in drawing order: later ones win where they overlap. */
+export const LANDCOVER = [
+  { name: 'Open land', color: '#cdd59c' },
+  { name: 'Farmland', color: '#e9dc98' },
+  { name: 'Built-up', color: '#c4605a' },
+  { name: 'Grass & meadow', color: '#9cc96b' },
+  { name: 'Wetland', color: '#79ae9c' },
+  { name: 'Forest', color: '#3d7537' },
+  { name: 'Rock & sand', color: '#b5a790' },
+  { name: 'Ice & glacier', color: '#f2f6f8' },
+  { name: 'Major roads', color: '#46464a' },
+];
+const ROADS = LANDCOVER.length - 1;
+const URBAN = 2;
+const COVER_CLASS = { farmland: 1, grass: 3, wetland: 4, wood: 5, rock: 6, sand: 6, ice: 7 };
+const URBAN_CLASS = new Set(['residential', 'commercial', 'industrial', 'retail', 'railway', 'garages']);
+// whole districts: only a stand-in where low-zoom tiles carry no residential areas
+const DISTRICT_CLASS = new Set(['suburb', 'neighbourhood', 'quarter']);
+const DETAIL_ZOOM = 10;
+const ROAD_CLASS = new Set(['motorway', 'trunk', 'primary']);
 
 let template = null;
 const cache = new Map();
@@ -114,19 +137,32 @@ function readFeature(r, layer) {
   return { props, paths };
 }
 
-/** @returns {{polys: object[], lines: object[]}} paths in 0..1 tile units */
-export function decodeWaterTile(bytes) {
-  const out = { polys: [], lines: [] };
+/**
+ * @returns {{polys: object[], lines: object[], cover: object[][]}} paths in 0..1 tile
+ *   units; cover[c] holds the polygons (lines for roads) of LANDCOVER category c
+ */
+export function decodeWaterTile(bytes, zoom = MAX_ZOOM) {
+  const out = { polys: [], lines: [], cover: LANDCOVER.map(() => []) };
+  const LAYERS = new Set(['water', 'waterway', 'landcover', 'landuse', 'transportation']);
   new Reader(bytes).fields((f, wire, r) => {
     if (f !== 3) return false;
     const layer = readLayer(r.sub());
-    if (layer.name !== 'water' && layer.name !== 'waterway') return true;
+    if (!LAYERS.has(layer.name)) return true;
     for (const fr of layer.features) {
       const { props, paths } = readFeature(fr, layer);
       if (layer.name === 'water') {
         if (props.class !== 'ocean') out.polys.push(...paths);
-      } else if (RIVER_CLASSES.has(props.class) && props.brunnel !== 'tunnel') {
-        out.lines.push(...paths);
+      } else if (layer.name === 'waterway') {
+        if (RIVER_CLASSES.has(props.class) && props.brunnel !== 'tunnel') out.lines.push(...paths);
+      } else if (layer.name === 'landcover') {
+        const c = COVER_CLASS[props.class];
+        if (c) out.cover[c].push(...paths);
+      } else if (layer.name === 'landuse') {
+        if (URBAN_CLASS.has(props.class) || (zoom < DETAIL_ZOOM && DISTRICT_CLASS.has(props.class))) {
+          out.cover[URBAN].push(...paths);
+        }
+      } else if (ROAD_CLASS.has(props.class) && props.brunnel !== 'tunnel') {
+        out.cover[ROADS].push(...paths);
       }
     }
     return true;
@@ -144,31 +180,36 @@ async function loadTile(z, x, y, signal) {
   const res = await fetch(url, { signal });
   // tiles without any data are simply missing
   const data = res.status === 404 || res.status === 204
-    ? { polys: [], lines: [] }
+    ? { polys: [], lines: [], cover: LANDCOVER.map(() => []) }
     : res.ok
-      ? decodeWaterTile(new Uint8Array(await res.arrayBuffer()))
+      ? decodeWaterTile(new Uint8Array(await res.arrayBuffer()), z)
       : null;
-  if (!data) throw new Error(`Water tile ${key} failed (HTTP ${res.status})`);
+  if (!data) throw new Error(`Map tile ${key} failed (HTTP ${res.status})`);
   if (cache.size > 200) cache.delete(cache.keys().next().value);
   cache.set(key, data);
   return data;
 }
 
-/** Download the water features covering the bounds. */
-export async function fetchWater(b, res, { signal } = {}) {
+/**
+ * Download the water and land cover features covering the bounds.
+ * With `landcover` the tiles are at least zoom 7, where land cover starts.
+ */
+export async function fetchWater(b, res, { signal, landcover = false } = {}) {
   if (!template) {
     const r = await fetch(TILEJSON, { signal });
-    if (!r.ok) throw new Error(`Water data unavailable (HTTP ${r.status})`);
+    if (!r.ok) throw new Error(`Map data unavailable (HTTP ${r.status})`);
     template = (await r.json()).tiles[0];
   }
   const x0 = mercX(b.west), x1 = mercX(b.east), y0 = mercY(b.north), y1 = mercY(b.south);
-  let zoom = Math.min(MAX_ZOOM, Math.max(0, Math.ceil(Math.log2(res / (512 * Math.max(x1 - x0, y1 - y0))))));
+  const maxTiles = landcover ? MAX_TILES_LANDCOVER : MAX_TILES;
+  let zoom = Math.max(0, Math.ceil(Math.log2(res / (512 * Math.max(x1 - x0, y1 - y0)))));
+  zoom = Math.min(MAX_ZOOM, landcover ? Math.max(zoom, 8) : zoom);
   let tx0, tx1, ty0, ty1;
   for (; ; zoom--) {
     const n = 2 ** zoom;
     tx0 = Math.floor(x0 * n); tx1 = Math.floor(x1 * n);
     ty0 = Math.max(0, Math.floor(y0 * n)); ty1 = Math.min(n - 1, Math.floor(y1 * n));
-    if ((tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= MAX_TILES || zoom === 0) break;
+    if ((tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= maxTiles || zoom === 0) break;
   }
   const jobs = [];
   for (let ty = ty0; ty <= ty1; ty++) {
@@ -179,11 +220,8 @@ export async function fetchWater(b, res, { signal } = {}) {
   return { zoom, tiles: await Promise.all(jobs) };
 }
 
-/**
- * Rasterise the features to a mask on the model grid (1 = water), row 0 = north.
- * @param {number} riverPx  width of river centre lines in grid cells
- */
-export function rasterizeWater(water, b, nx, ny, riverPx) {
+// Draws tile features onto a canvas whose pixel i is grid vertex i, row 0 = north.
+function featureCanvas(water, b, nx, ny) {
   const x0 = mercX(b.west), y0 = mercY(b.north);
   const sx = (nx - 1) / (mercX(b.east) - x0), sy = (ny - 1) / (mercY(b.south) - y0);
   const n = 2 ** water.zoom;
@@ -191,35 +229,72 @@ export function rasterizeWater(water, b, nx, ny, riverPx) {
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   ctx.fillStyle = ctx.strokeStyle = '#fff';
   ctx.lineJoin = ctx.lineCap = 'round';
-  ctx.lineWidth = Math.max(1.4, riverPx);
 
-  for (const t of water.tiles) {
-    // grid vertex i sits at the centre of mask pixel i
-    const px = (u) => ((t.x + u) / n - x0) * sx + 0.5;
-    const py = (v) => ((t.y + v) / n - y0) * sy + 0.5;
-    const trace = (paths, close) => {
-      ctx.beginPath();
-      for (const p of paths) {
-        for (let k = 0; k < p.pts.length; k += 2) {
-          k ? ctx.lineTo(px(p.pts[k]), py(p.pts[k + 1])) : ctx.moveTo(px(p.pts[k]), py(p.pts[k + 1]));
+  /** Fills polys(tile) and strokes lines(tile) with the current style. */
+  const draw = (polys, lines) => {
+    for (const t of water.tiles) {
+      // grid vertex i sits at the centre of mask pixel i
+      const px = (u) => ((t.x + u) / n - x0) * sx + 0.5;
+      const py = (v) => ((t.y + v) / n - y0) * sy + 0.5;
+      const trace = (paths, close) => {
+        ctx.beginPath();
+        for (const p of paths) {
+          for (let k = 0; k < p.pts.length; k += 2) {
+            k ? ctx.lineTo(px(p.pts[k]), py(p.pts[k + 1])) : ctx.moveTo(px(p.pts[k]), py(p.pts[k + 1]));
+          }
+          if (close) ctx.closePath();
         }
-        if (close) ctx.closePath();
-      }
-    };
-    // clip to the tile: features carry a buffer that overlaps the neighbours
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(px(0), py(0), px(1) - px(0), py(1) - py(0));
-    ctx.clip();
-    trace(t.polys, true);
-    ctx.fill();
-    ctx.restore();
-    trace(t.lines, false);
-    ctx.stroke();
-  }
+      };
+      // clip to the tile: features carry a buffer that overlaps the neighbours
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(px(0), py(0), px(1) - px(0), py(1) - py(0));
+      ctx.clip();
+      trace(polys(t), true);
+      ctx.fill();
+      ctx.restore();
+      trace(lines(t), false);
+      ctx.stroke();
+    }
+  };
+  const mask = (onto, value) => {
+    const data = ctx.getImageData(0, 0, nx, ny).data;
+    for (let k = 0; k < onto.length; k++) if (data[k * 4 + 3] > 110) onto[k] = value;
+  };
+  return { ctx, draw, mask };
+}
 
-  const data = ctx.getImageData(0, 0, nx, ny).data;
-  const mask = new Uint8Array(nx * ny);
-  for (let k = 0; k < mask.length; k++) mask[k] = data[k * 4 + 3] > 110 ? 1 : 0;
-  return mask;
+/**
+ * Rasterise the water features to a mask on the model grid (1 = water), row 0 = north.
+ * @param {number} riverPx  width of river centre lines in grid cells
+ */
+export function rasterizeWater(water, b, nx, ny, riverPx) {
+  const { ctx, draw, mask } = featureCanvas(water, b, nx, ny);
+  ctx.lineWidth = Math.max(1.4, riverPx);
+  draw((t) => t.polys, (t) => t.lines);
+  const out = new Uint8Array(nx * ny);
+  mask(out, 1);
+  return out;
+}
+
+/**
+ * Rasterise the land cover to LANDCOVER indices on the model grid, row 0 = north.
+ * @param {number} roadPx  width of roads in grid cells, 0 to leave roads out
+ */
+export function rasterizeLandcover(water, b, nx, ny, roadPx) {
+  const { ctx, draw, mask } = featureCanvas(water, b, nx, ny);
+  const out = new Uint8Array(nx * ny);
+  const none = () => [];
+  for (let c = 1; c < LANDCOVER.length; c++) {
+    ctx.clearRect(0, 0, nx, ny);
+    if (c === ROADS) {
+      if (!roadPx) continue;
+      ctx.lineWidth = Math.max(1.2, roadPx);
+      draw(none, (t) => t.cover[c]);
+    } else {
+      draw((t) => t.cover[c], none);
+    }
+    mask(out, c);
+  }
+  return out;
 }

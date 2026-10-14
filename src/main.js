@@ -1,7 +1,8 @@
 import { createMap, searchPlace } from './map.js';
 import { createPreview } from './preview.js';
 import { fetchElevation, groundSize } from './elevation.js';
-import { fetchWater, rasterizeWater } from './water.js';
+import { fetchWater, rasterizeWater, rasterizeLandcover, LANDCOVER } from './water.js';
+import { fetchImagery } from './imagery.js';
 import { computeModel } from './heightmap.js';
 import { PRESETS, makePalette } from './palettes.js';
 import { CURVE_PRESETS, createCurveEditor } from './curve.js';
@@ -22,9 +23,11 @@ const DEFAULTS = {
   riverMM: 0.8,
   layerH: 0.2,
   reliefLayers: 60,
+  heightMM: null, // total model height; reliefLayers follows it
   baseMM: 1.2,
   snap: false,
   nColors: 4,
+  colorBy: 'height',
   preset: 'natural',
   distribution: 'height',
   colors: null, // set once the user edits a swatch
@@ -55,7 +58,9 @@ function setStatus(text, isError = false) {
 
 // ---------------------------------------------------------------- mesh worker
 
-const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+// the query string gives the worker and its imports fresh cache entries (bump it if a
+// browser keeps running an old worker)
+const worker = new Worker(new URL('./worker.js?v=2', import.meta.url), { type: 'module' });
 const pending = new Map();
 let jobId = 0;
 worker.onmessage = (ev) => {
@@ -66,12 +71,15 @@ worker.onerror = (ev) => {
   for (const p of pending.values()) p.reject(new Error(ev.message || 'Mesh worker failed'));
   pending.clear();
 };
-/** Resolves to { meshes: one per band, inlay: solid between grid.z and zTop (or null) }. */
-function buildMeshes(grid, bands, zTop = null) {
+/**
+ * Resolves to { meshes, inlay: solid between grid.z and zTop (or null) }. meshes has
+ * one solid per band, or with `facets` one per colour index (steepness colours).
+ */
+function buildMeshes(grid, bands, zTop = null, facets = null) {
   return new Promise((resolve, reject) => {
     const id = ++jobId;
     pending.set(id, { resolve, reject });
-    worker.postMessage({ id, ...grid, zTop, bands: bands.map((b) => ({ lo: b.lo, hi: b.hi })) });
+    worker.postMessage({ id, ...grid, zTop, facets, bands: bands.map((b) => ({ lo: b.lo, hi: b.hi })) });
   });
 }
 
@@ -80,8 +88,11 @@ function buildMeshes(grid, bands, zTop = null) {
 const preview = createPreview($('#preview'));
 let elevation = null; // { elev, nx, ny, zoom }
 let model = null;     // computeModel() result
-let water = null;     // lake and river features for the current bounds
+let water = null;     // lake, river and land cover features for the current bounds
 let waterNote = '';
+let imagery = null;   // satellite r, g, b per grid vertex
+let imageryNote = '';
+let loaded = { vector: false, landcover: false, imagery: false }; // what the last download covered
 let grid = null;      // { z, nx, ny, dx, dy } of the full top surface
 let size = null;      // { width, depth, height } in mm
 let parts = [];       // [{ color, label, tris }] one closed part per palette colour in use
@@ -91,34 +102,48 @@ let buildSeq = 0;
 
 function palette() {
   if (state.colors?.length === state.nColors) return state.colors;
+  if (model?.autoColors) return model.autoColors; // satellite and land cover bring their own
   return makePalette(state.preset, state.nColors, paletteHasWater);
 }
+
+// Data beyond elevation that the current settings need.
+const needsVector = () => state.inlandWater || state.colorBy === 'landcover';
+const needsImagery = () => state.colorBy === 'satellite';
 
 async function loadElevation() {
   fetchAbort?.abort();
   const abort = (fetchAbort = new AbortController());
   setStatus('Loading elevation…');
   try {
-    // lakes and rivers are optional: without them the model is still built
-    const waterJob = state.inlandWater
-      ? fetchWater(state.bounds, state.resolution, { signal: abort.signal }).then(
-        (w) => ((waterNote = ''), w),
-        (err) => {
-          if (!abort.signal.aborted) {
-            console.error(err);
-            waterNote = `Lakes and rivers could not be loaded (${err.message}).`;
-          }
-          return null;
-        })
+    // map features and imagery are optional: without them the model is still built
+    const optional = (job, setNote, what) => job.then(
+      (v) => (setNote(''), v),
+      (err) => {
+        if (!abort.signal.aborted) {
+          console.error(err);
+          setNote(`${what} could not be loaded (${err.message}).`);
+        }
+        return null;
+      });
+    const want = { vector: needsVector(), landcover: state.colorBy === 'landcover', imagery: needsImagery() };
+    const waterJob = want.vector
+      ? optional(fetchWater(state.bounds, state.resolution, { signal: abort.signal, landcover: state.colorBy === 'landcover' }),
+        (t) => (waterNote = t), 'Lakes, rivers and land cover')
       : ((waterNote = ''), null);
     const elevationJob = fetchElevation(state.bounds, state.resolution, {
       signal: abort.signal,
       onProgress: (done, total) => setStatus(`Loading elevation… ${done}/${total} tiles`),
     });
-    const [e, w] = await Promise.all([elevationJob, waterJob]);
+    const imageryJob = want.imagery
+      ? optional(elevationJob.then((e) => fetchImagery(state.bounds, e.nx, e.ny, { signal: abort.signal })),
+        (t) => (imageryNote = t), 'Satellite imagery')
+      : ((imageryNote = ''), null);
+    const [e, w, img] = await Promise.all([elevationJob, waterJob, imageryJob]);
     if (abort.signal.aborted) return;
     elevation = e;
     water = w;
+    imagery = img;
+    loaded = want;
   } catch (err) {
     if (abort.signal.aborted) return;
     console.error(err);
@@ -141,7 +166,16 @@ async function rebuild() {
   const waterMask = state.inlandWater && water
     ? rasterizeWater(water, state.bounds, nx, ny, state.riverMM / dx)
     : null;
-  model = computeModel(elev, nx, ny, { ...state, waterMask });
+  // roads only where they are not much narrower than a grid sample
+  const roadPx = ground.width / (nx - 1) <= 250 ? state.riverMM / dx : 0;
+  const landcover = state.colorBy === 'landcover' && water
+    ? rasterizeLandcover(water, state.bounds, nx, ny, roadPx)
+    : null;
+  model = computeModel(elev, nx, ny, {
+    ...state, waterMask, imagery, landcover, landcoverDefs: LANDCOVER,
+    groundDX: ground.width / (nx - 1), groundDY: ground.height / (ny - 1),
+  });
+  const byFacet = model.stats.colorBy !== 'height';
   paletteHasWater = model.stats.waterColor;
   const nextGrid = { z: model.z, nx, ny, dx, dy };
   const nextSize = { width, depth, height: model.stats.totalMM };
@@ -155,7 +189,10 @@ async function rebuild() {
   let built;
   try {
     // colour bands are cut from the carved surface, the inlay fills the carving
-    built = await buildMeshes({ ...nextGrid, z: model.zLand }, model.bands, model.stats.inlay ? model.z : null);
+    const facets = byFacet
+      ? { floor: model.floor, cls: model.cls, nClasses: state.nColors, baseColor: model.bands[0].color }
+      : null;
+    built = await buildMeshes({ ...nextGrid, z: model.zLand }, model.bands, model.stats.inlay ? model.z : null, facets);
   } catch (err) {
     console.error(err);
     setStatus(`Could not build the model: ${err.message}`, true);
@@ -164,7 +201,7 @@ async function rebuild() {
   if (seq !== buildSeq) return;
   grid = nextGrid;
   size = nextSize;
-  const next = model.bands.map((b, i) => ({ color: b.color, label: bandLabel(b), tris: built.meshes[i] }));
+  const next = model.bands.map((b, i) => ({ color: b.color, label: bandLabel(b), tris: built.meshes[byFacet ? b.color : i] }));
   if (built.inlay) {
     const sea = next.find((p) => p.color === 0);
     if (sea) {
@@ -236,7 +273,18 @@ function renderFacts(ground, sz) {
 
 function bandLabel(band) {
   if (model.stats.seaBand && band.color === 0) return model.stats.inlay ? 'Water + base' : 'Sea + base';
-  return `Color ${band.color + 1}`;
+  return band.name || `Color ${band.color + 1}`;
+}
+
+/** Description of a per-triangle colour (steepness, satellite, land cover). */
+function facetRange(band) {
+  const pct = `${fmt(band.share * 100, 0)}% of area`;
+  if (band.sea) return `sea · ${pct}`;
+  if (band.loDeg === undefined) return pct;
+  if (band.loDeg <= 0 && band.hiDeg >= 90) return `all slopes · ${pct}`;
+  if (band.loDeg <= 0) return `under ${fmt(band.hiDeg, 0)}° · ${pct}`;
+  if (band.hiDeg >= 90) return `over ${fmt(band.loDeg, 0)}° · ${pct}`;
+  return `${fmt(band.loDeg, 0)}°–${fmt(band.hiDeg, 0)}° · ${pct}`;
 }
 
 function renderBands() {
@@ -261,7 +309,7 @@ function renderBands() {
     where.className = 'where';
     if (band) {
       name.textContent = bandLabel(band);
-      where.textContent = `layers ${band.fromLayer + 1}–${band.toLayer} · z ${fmt(band.lo, 2)} mm`;
+      where.textContent = model.stats.colorBy !== 'height' ? facetRange(band) : `layers ${band.fromLayer + 1}–${band.toLayer} · z ${fmt(band.lo, 2)} mm`;
     } else if (i === 0 && model.stats.inlay) {
       name.textContent = 'Water';
       where.textContent = `lakes, rivers · inlaid ${fmt(model.stats.lakeMM, 2)} mm`;
@@ -275,14 +323,26 @@ function renderBands() {
   }));
   const hint = [];
   const usedColors = model.bands.length + (model.stats.inlay && !model.stats.seaBand ? 1 : 0);
-  if (usedColors < colors.length) hint.push('Not enough relief layers for every color — add layers or use fewer colors.');
-  if (model.bands.length > 1) {
+  if (usedColors < colors.length) {
+    hint.push(model.stats.colorBy !== 'height'
+      ? 'Some colors cover no terrain — use fewer colors.'
+      : 'Not enough relief layers for every color — add layers or use fewer colors.');
+  }
+  if (model.stats.colorBy !== 'height') {
+    if (model.bands.length > 1) {
+      hint.push('These colors run through the model as columns, so most layers mix colors: this needs a multi-material printer (3MF or STL per color).');
+    }
+    if (model.stats.colorBy === 'landcover') {
+      hint.push('Land cover from OpenStreetMap; with fewer colors than categories, the rarest become open land.');
+    }
+  } else if (model.bands.length > 1) {
     hint.push('Single-nozzle printer: export the STL and change filament at the first layer of each color.');
   }
   if (model.stats.inlay) {
     hint.push('Lakes and rivers are inlaid at their own height, so they need a multi-material printer (3MF or STL per color); the single-body STL has no separate water.');
   }
   if (waterNote) hint.push(waterNote);
+  if (imageryNote && model.stats.colorBy === 'satellite') hint.push(imageryNote);
   $('#bands-hint').textContent = hint.join(' ');
 }
 
@@ -292,12 +352,55 @@ const presetSelect = $('#preset');
 for (const [key, p] of Object.entries(PRESETS)) presetSelect.add(new Option(p.name, key));
 
 const AFFECTS_ELEVATION = new Set(['resolution', 'inlandWater']);
-const RESETS_COLORS = new Set(['nColors', 'preset']);
+const RESETS_COLORS = new Set(['nColors', 'preset', 'colorBy']);
+const paramInput = (key) => document.querySelector(`[data-param="${key}"]`);
+
+// Model height and relief layers describe the same thing: keep both in step.
+const baseHeight = () => Math.max(1, Math.round(state.baseMM / state.layerH)) * state.layerH;
+const heightFromLayers = () => +(baseHeight() + state.reliefLayers * state.layerH).toFixed(2);
+if (!Number.isFinite(state.heightMM)) state.heightMM = heightFromLayers();
+// The model is at most a quarter as high as its longest side.
+const maxHeight = () => state.sizeMM / 4;
+function syncHeight(changed) {
+  const maxH = maxHeight();
+  const heightInputs = document.querySelectorAll('[data-param="heightMM"]');
+  for (const inp of heightInputs) inp.max = maxH;
+  if (changed === 'reliefLayers') state.heightMM = heightFromLayers();
+  const clamped = state.heightMM > maxH;
+  if (clamped) state.heightMM = maxH;
+  if (clamped || ['heightMM', 'layerH', 'baseMM', 'sizeMM', undefined].includes(changed)) {
+    const inp = paramInput('reliefLayers');
+    let r = Math.min(+inp.max, Math.max(+inp.min, Math.round((state.heightMM - baseHeight()) / state.layerH)));
+    if (r > 1 && baseHeight() + r * state.layerH > maxH + 1e-9) r--;
+    state.reliefLayers = r;
+    inp.value = r;
+  }
+  for (const inp of heightInputs) inp.value = state.heightMM;
+}
+
+// Each colouring has its own default palette.
+// Satellite and land cover bring their own colours, so palette and split do not apply.
+const MODE_PRESET = { height: 'natural', slope: 'steepness' };
+function syncColorBy(changed) {
+  const mode = state.colorBy;
+  if (changed === 'colorBy' && MODE_PRESET[mode] && Object.values(MODE_PRESET).includes(state.preset)) {
+    state.preset = MODE_PRESET[mode];
+    presetSelect.value = state.preset;
+  }
+  const own = !MODE_PRESET[mode];
+  presetSelect.closest('label').hidden = own;
+  paramInput('distribution').closest('label').hidden = own;
+  paramInput('distribution').options[0].text = mode === 'slope' ? 'Equal steps' : 'Equal height';
+}
+
+const showOutput = (key) => {
+  const output = document.querySelector(`output[data-for="${key}"]`);
+  if (output) output.textContent = paramInput(key).value + (output.dataset.suffix || '');
+};
 
 for (const input of document.querySelectorAll('[data-param]')) {
   const key = input.dataset.param;
-  const output = document.querySelector(`output[data-for="${key}"]`);
-  const show = () => output && (output.textContent = input.value);
+  const show = () => showOutput(key);
   if (input.type === 'checkbox') input.checked = state[key];
   else input.value = state[key];
   show();
@@ -316,9 +419,14 @@ for (const input of document.querySelectorAll('[data-param]')) {
     if (v === null || v === state[key]) return;
     state[key] = v;
     if (RESETS_COLORS.has(key)) state.colors = null;
+    syncHeight(key);
+    syncColorBy(key);
     save();
     if (key === 'basemap') mapView.setBasemap(v);
     else if (AFFECTS_ELEVATION.has(key)) final && loadElevation();
+    else if (key === 'colorBy' && (
+      (needsVector() && !loaded.vector) || (state.colorBy === 'landcover' && !loaded.landcover) ||
+      (needsImagery() && !loaded.imagery))) loadElevation();
     else scheduleRebuild();
   };
   // sliders update live, except those that trigger a download
@@ -330,6 +438,8 @@ for (const input of document.querySelectorAll('[data-param]')) {
     if (input.type === 'number' && read() !== null) input.value = state[key];
   });
 }
+syncHeight();
+syncColorBy();
 
 // ---------------------------------------------------------------- height curve
 
@@ -435,19 +545,26 @@ function changeList() {
     `Print size ${size.width.toFixed(1)} x ${size.depth.toFixed(1)} mm`,
     '',
   ];
+  const byFacet = model.stats.colorBy !== 'height';
   model.bands.forEach((b) => {
-    lines.push(
-      `${bandLabel(b)} (${colors[b.color]}): layers ${b.fromLayer + 1}-${b.toLayer}, ` +
-      `starts at z = ${b.lo.toFixed(2)} mm`,
-    );
+    lines.push(byFacet
+      ? `${bandLabel(b)} (${colors[b.color]}): ${facetRange(b).replace('°–', '-').replace(/°/g, ' deg')}`
+      : `${bandLabel(b)} (${colors[b.color]}): layers ${b.fromLayer + 1}-${b.toLayer}, ` +
+        `starts at z = ${b.lo.toFixed(2)} mm`);
   });
+  if (byFacet) {
+    lines.push(
+      'Colors follow the terrain surface and run from the base plate to the top, so most layers ' +
+      'mix colors. This needs a multi-material printer.',
+    );
+  }
   if (model.stats.inlay) {
     lines.push(
       `Water (${colors[0]}) also fills lakes and rivers: the top ${model.stats.lakeMM.toFixed(2)} mm of the surface there, ` +
       'at any height. This needs a multi-material printer.',
     );
   }
-  lines.push('', 'Layer numbers assume every layer, including the first, uses the layer height above.');
+  if (!byFacet) lines.push('', 'Layer numbers assume every layer, including the first, uses the layer height above.');
   return lines.join('\n') + '\n';
 }
 

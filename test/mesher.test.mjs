@@ -2,7 +2,7 @@
 // Checks that every generated band is a closed, outward-facing solid and that the
 // bands together fill exactly the same volume as the one-piece model.
 import assert from 'node:assert/strict';
-import { buildBand, buildInlay } from '../src/mesher.js';
+import { buildBand, buildFacets, buildInlay } from '../src/mesher.js';
 import { computeModel } from '../src/heightmap.js';
 import { weld } from '../src/exporters.js';
 
@@ -94,6 +94,37 @@ for (const snap of [false, true]) {
           sum += v;
         }
         assert.ok(Math.abs(sum - vWhole) / vWhole < 1e-5, `bands fill the model: ${sum} vs ${vWhole}`);
+
+        // the same terrain coloured per triangle: base plate + one column solid per colour
+        const imagery = new Uint8Array(nx * ny * 3).map((_, k) => (k * 37 + (k % 3) * 90) % 256);
+        const landcover = new Uint8Array(nx * ny).map((_, k) => (k % nx < 10 ? 4 : (k * 7) % 9));
+        const landcoverDefs = Array.from({ length: 9 }, (_, c) => ({ name: `c${c}`, color: `#${String(c).repeat(6)}` }));
+        for (const colorBy of ['slope', 'satellite', 'landcover']) {
+          const sm = computeModel(elev, nx, ny, {
+            waterMask, lakeLayers: 3,
+            layerH: 0.2, reliefLayers: 40, baseMM: 1.2, snap, seaMode, coastLayers: 2,
+            smoothing: 1, nColors, distribution, colorBy, groundDX: 90, groundDY: 90,
+            imagery, landcover, landcoverDefs,
+          });
+          const what = `${colorBy} (${seaMode}, snap=${snap}, n=${nColors})`;
+          assert.ok(sm.bands.length >= 1 && sm.bands.length <= nColors, `band count ${what}`);
+          assert.ok(sm.cls.every((c) => c < nColors), `colour index in range ${what}`);
+          if (colorBy !== 'slope') assert.equal(sm.autoColors.length, nColors, `palette size ${what}`);
+          const solidS = buildBand(sm.z, nx, ny, dx, dy, 0, Infinity);
+          const plate = buildBand(sm.floor, nx, ny, dx, dy, 0, Infinity);
+          assert.equal(openEdges(plate), 0, 'base plate closed');
+          let sumS = volume(plate);
+          if (sm.stats.inlay) sumS += volume(buildInlay(sm.zLand, sm.z, nx, ny, dx, dy));
+          const cols = buildFacets(sm.floor, sm.zLand, nx, ny, dx, dy, sm.cls, nColors);
+          for (const b of sm.bands) {
+            const t = cols[b.color];
+            assert.equal(openEdges(t), 0, `colour ${b.color} closed ${what}`);
+            // the base plate is merged into the first colour (flat sea has no column of its own)
+            assert.ok(volume(t) > 0 || (b === sm.bands[0] && b.sea), `colour ${b.color} has volume ${what}`);
+          }
+          for (const t of cols) sumS += volume(t);
+          assert.ok(Math.abs(sumS - volume(solidS)) / volume(solidS) < 1e-5, `colours fill the model ${what}`);
+        }
         cases++;
       }
     }
